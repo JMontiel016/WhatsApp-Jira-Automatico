@@ -7,6 +7,7 @@ import {saveRecoveredMedia} from '@/lib/media';
 import fs from 'node:fs';
 import path from 'node:path';
 import {z} from 'zod';
+import {runAutomation} from '@/lib/automation';
 export const runtime='nodejs';
 export async function POST(request:NextRequest){
   const expected=process.env.WHATSAPP_LOCAL_SECRET || '';
@@ -22,7 +23,7 @@ export async function POST(request:NextRequest){
   // Mensajería solo de lectura: cualquier mensaje fuera de horario queda pendiente.
   // La clave única del evento impide duplicar el mismo mensaje en reintentos.
   const eligible=rule.outside && !v.outbound;
-  d.prepare('INSERT OR IGNORE INTO cases(phone,customer,message,received_at,local_date,local_time,reason,outside_hours,status,dedupe_key,source,direction,has_media,wa_chat_id,is_group,sender_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(v.phone,v.customer,v.message,v.receivedAt,rule.date,rule.hour,rule.reason,eligible?1:0,eligible?'pending':'ignored',dedupe,'whatsapp',v.outbound?'out':'in',v.hasMedia?1:0,chatId,v.isGroup?1:0,v.senderName||null);
+  const inserted = d.prepare('INSERT OR IGNORE INTO cases(phone,customer,message,received_at,local_date,local_time,reason,outside_hours,status,dedupe_key,source,direction,has_media,wa_chat_id,is_group,sender_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(v.phone,v.customer,v.message,v.receivedAt,rule.date,rule.hour,rule.reason,eligible?1:0,eligible?'pending':'ignored',dedupe,'whatsapp',v.outbound?'out':'in',v.hasMedia?1:0,chatId,v.isGroup?1:0,v.senderName||null);
   // El nombre/foto son información opcional de la sesión vinculada; no se inventan.
   const safeAvatar = v.avatarUrl && /^https:\/\/[^\s]+$/.test(v.avatarUrl) ? v.avatarUrl : null;
   if (!v.outbound) d.prepare(`INSERT INTO contact_profiles(phone,name,avatar_url,is_group) VALUES (?,?,?,?)
@@ -53,10 +54,24 @@ export async function POST(request:NextRequest){
       d.prepare('UPDATE cases SET media_error=? WHERE id=?').run(msg.slice(0,450),c.id);
       console.warn('[MEDIA] Guardado fallido, caso:',c.id,msg);
       // El conector debe saber que todavía no se persistió y reintentar.
-      return NextResponse.json({status:c.status,caseId:c.id,mediaSaved:false,mediaError:msg}, {status:422});
+      // El bot se ejecuta después de persistir el evento y los archivos.
+  // Una segunda entrega del mismo ID solamente sincroniza la evidencia.
+  let automationReply:string|null=null;
+  try {
+    automationReply=await runAutomation({
+      message:d.prepare('SELECT * FROM cases WHERE id=?').get(c.id) as typeof c,
+      isNew:inserted.changes===1,outside:rule.outside,isGroup:Boolean(v.isGroup),
+      outbound:Boolean(v.outbound),hasMedia:Boolean(v.hasMedia),
+      mediaReady:Boolean((d.prepare('SELECT media_path FROM cases WHERE id=?').get(c.id) as {media_path:string|null}).media_path),
+      receivedAt:v.receivedAt
+    });
+  } catch(error) {
+    console.error('[BOT] Error al procesar conversación:',error);
+  }
+  return NextResponse.json({status:c.status,caseId:c.id,mediaSaved:false,mediaError:msg}, {status:422});
     }
   } else if (v.mediaError && !available) {
     d.prepare('UPDATE cases SET media_error=? WHERE id=?').run(v.mediaError,c.id);
   }
-  return NextResponse.json({status:c.status,caseId:c.id,reason:rule.reason,jiraKey:c.jira_key,mediaSaved:Boolean(v.media&& (available||d.prepare('SELECT media_path FROM cases WHERE id=?').get(c.id)))});
+  return NextResponse.json({status:c.status,caseId:c.id,reason:rule.reason,jiraKey:c.jira_key,automationReply,mediaSaved:Boolean(v.media&& (available||d.prepare('SELECT media_path FROM cases WHERE id=?').get(c.id)))});
 }
