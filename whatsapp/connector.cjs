@@ -94,6 +94,8 @@ fs.mkdirSync(DATA_DIR, {
 // ========================================
 
 let ready = false;
+let pairingQr = null;
+let pairingQrAt = 0;
 let compatibility = 'pending';
 
 let seen = new Set();
@@ -390,6 +392,8 @@ async function repairWebMessageKeys() {
 // ========================================
 
 client.on('qr', qr => {
+  pairingQr = qr;
+  pairingQrAt = Date.now();
   console.log(
     '[WHATSAPP] Escaneá el QR desde dispositivos vinculados.'
   );
@@ -398,10 +402,13 @@ client.on('qr', qr => {
 });
 
 client.on('authenticated', () => {
+  pairingQr = null;
   console.log('[WHATSAPP] Sesión autenticada.');
 });
 
 client.on('ready', async () => {
+  pairingQr = null;
+  pairingQrAt = 0;
   ready = false;
 
   await repairWebMessageKeys();
@@ -414,6 +421,7 @@ client.on('ready', async () => {
 });
 
 client.on('auth_failure', error => {
+  pairingQr = null;
   ready = false;
 
   console.error(
@@ -423,6 +431,7 @@ client.on('auth_failure', error => {
 });
 
 client.on('disconnected', reason => {
+  pairingQr = null;
   ready = false;
   recentMediaHistory.clear();
 
@@ -932,6 +941,18 @@ async function processMessage(message, outbound = false) {
 
     console.log('[TICKETBRIDGE] Mensaje registrado:',
       result.status || 'ok', 'caso:', result.caseId || '-');
+    // Se reutiliza el JID exacto del mensaje recibido para evitar
+    // asociaciones erróneas de números LID y c.us.
+    if (!outbound && !isGroup && typeof result.automationReply === 'string' && result.automationReply.trim()) {
+      try {
+        const sent = normalizeMessage(await client.sendMessage(sender,result.automationReply,{
+          sendSeen:false
+        }));
+        if(!messageId(sent)) console.warn('[BOT] Envío no confirmado, revisar conversación.');
+      } catch(error) {
+        console.error('[BOT] No se pudo entregar respuesta automática:',errorText(error));
+      }
+    }
 
     // Enviar el archivo con el MISMO eventId: la API actualiza esa fila.
     if (isMediaMessage(message)) {
@@ -1460,7 +1481,8 @@ const server = http.createServer(async (request, response) => {
         version: 'ticketbridge-sync-v6.4',
         capabilities: ['history', 'chat-state', 'contacts', 'recover-batch', 'discover', 'read-snapshot', 'reactions', 'reactions-snapshot', 'send-media', 'media-mimetype-fallback'],
         compatibility,
-        packageMediaPatched
+        packageMediaPatched,
+        pairingQrAvailable: !ready && !!pairingQr && Date.now()-pairingQrAt<60000
       });
     }
 
@@ -1470,6 +1492,15 @@ const server = http.createServer(async (request, response) => {
       });
     }
 
+    // El QR solo está disponible localmente y detrás del secreto del conector.
+    // Nunca se publica en /status ni cuando la cuenta está conectada.
+    if (request.method === 'GET' && route === '/pairing-qr') {
+      if (ready) return sendJson(response,200,{connected:true,qr:null});
+      return sendJson(response,200,{
+        connected:false,
+        qr:pairingQr && Date.now()-pairingQrAt<60000 ? pairingQr : null
+      });
+    }
     if (!ready) {
       return sendJson(response, 503, {
         error: 'WhatsApp todavía no está conectado'
