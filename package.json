@@ -1,0 +1,31 @@
+{
+  "name": "whatsapp-jira-local",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -H 127.0.0.1 -p 3000",
+    "build": "next build",
+    "start": "next start -H 127.0.0.1 -p 3000",
+    "whatsapp": "node whatsapp/connector.cjs",
+    "postinstall": "node scripts/reparar-whatsapp.cjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.4.7",
+    "lucide-react": "^0.468.0",
+    "luxon": "^3.7.0",
+    "next": "^15.5.0",
+    "qrcode-terminal": "^0.12.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "whatsapp-web.js": "^1.34.6",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/luxon": "^3.6.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.1.0",
+    "typescript": "^5.8.0"
+  }
+}

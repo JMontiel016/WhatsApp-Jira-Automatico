@@ -1,0 +1,7 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { z } from 'zod';
+import {database} from '@/lib/db';
+import {rejectCrossOrigin} from '@/lib/security';
+export const runtime='nodejs';
+export async function GET(){const rows=database().prepare('SELECT name,value FROM settings').all() as {name:string;value:string}[];return NextResponse.json(Object.fromEntries(rows.map(r=>[r.name,r.value])));}
+export async function PUT(r:NextRequest){const rejected=rejectCrossOrigin(r);if(rejected)return rejected;const parsed=z.object({start:z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),end:z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/)}).safeParse(await r.json().catch(()=>null));if(!parsed.success||parsed.data.start>=parsed.data.end)return NextResponse.json({error:'Horario inválido'},{status:400});const d=database();d.prepare("UPDATE settings SET value=? WHERE name='start'").run(parsed.data.start);d.prepare("UPDATE settings SET value=? WHERE name='end'").run(parsed.data.end);return NextResponse.json({ok:true});}

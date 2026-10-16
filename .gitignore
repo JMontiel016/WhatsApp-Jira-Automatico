@@ -1,0 +1,61 @@
+node_modules
+.next
+.env.local
+.env
+/data/*.sqlite
+/data/*.sqlite-*
+*.log
+
+/data/.wwebjs_auth/
+/data/whatsapp-processed.json
+
+.wwebjs_auth/
+.wwebjs_cache/
+*.backup
+/data/media/
+/data/*.sqlite*
+.env.*
+!.env.example
+
+# Dependencias y compilación
+node_modules/
+.next/
+dist/
+build/
+coverage/
+
+# Variables privadas
+.env
+.env.*
+!.env.example
+!.env.sample
+.npmrc
+
+# Sesiones WhatsApp
+.wwebjs_auth/
+.wwebjs_cache/
+data/
+
+# Base de datos
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+
+# Logs y respaldos
+*.log
+logs/
+backups/
+respaldo*/
+*.zip
+*.tar.gz
+
+# Claves privadas
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Sistema
+.DS_Store
