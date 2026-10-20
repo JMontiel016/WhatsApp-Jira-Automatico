@@ -1,0 +1,40 @@
+'use strict';
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const path=require('node:path');
+const vm=require('node:vm');
+const ts=require('typescript');
+const root=path.resolve(__dirname,'..');
+function load(file,fetchImpl,dependencies={}){
+ const src=fs.readFileSync(path.join(root,file),'utf8');
+ const code=ts.transpileModule(src,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+ const module={exports:{}};
+ vm.runInNewContext(code,{module,exports:module.exports,require:(name)=>{if(dependencies[name])return dependencies[name];throw Error('Dependencia inesperada '+name);},fetch:fetchImpl,AbortSignal,process:{env:{WHATSAPP_LOCAL_SECRET:'x'.repeat(32)}},console}, {filename:file});
+ return module.exports;
+}
+(async()=>{
+ const status={connected:true,ready:true,version:'ticketbridge-sync-v6.7-sync',accountId:'595981234567@c.us'};
+ const mock=async()=>({ok:true,json:async()=>status});
+ const version=load('lib/whatsapp-version.ts',mock);
+ const account=load('lib/active-account.ts',mock,{'./whatsapp-version':version});
+ assert.equal(version.isConnectorVersionCompatible(status.version),true);
+ assert.equal(version.connectorReady(status),true);
+ assert.equal((await version.requireWhatsAppConnector()).ok,true);
+ assert.equal(await account.linkedAccount(),status.accountId);
+ status.version='ticketbridge-sync-v6.6-menu';
+ assert.equal(version.isConnectorVersionCompatible(status.version),false);
+ assert.equal(version.connectorReady(status),false);
+ assert.equal((await version.requireWhatsAppConnector()).ok,false);
+ assert.equal(await account.linkedAccount(),null);
+ status.version='ticketbridge-sync-v6.7-sync';status.ready=false;
+ assert.equal(await account.linkedAccount(),null);
+ status.ready=true;status.accountId='invalido';
+ assert.equal(await account.linkedAccount(),null);
+ assert.equal(version.connectorReady(status),false);
+ const text=fs.readFileSync(path.join(root,'app/api/whatsapp/status/route.ts'),'utf8');
+ assert.ok(text.includes('connectorReady(d)'),'La interfaz debe usar validación compartida');
+ assert.ok(text.includes('WHATSAPP_CONNECTOR_VERSION'),'La interfaz debe usar la misma versión');
+ const ticket=fs.readFileSync(path.join(root,'app/api/tickets/route.ts'),'utf8');
+ assert.match(ticket,/account_id=\?/,'Los tickets no deben filtrarse por cuenta diferente');
+ console.log('[OK] Versión única, cuenta autenticada, aislamiento de cuentas y estado web coherente');
+})().catch(e=>{console.error(e);process.exitCode=1;});

@@ -1,0 +1,95 @@
+# W-Ticket — nunca publicar claves, datos de usuarios ni sesiones
+node_modules/
+.next/
+.turbo/
+.vercel/
+coverage/
+*.tsbuildinfo
+
+# Variables de entorno y archivos locales de conexión
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.env
+*.env.*
+!.env.example
+!.env.*.example
+.npmrc
+.pypirc
+**/credentials.json
+**/service-account*.json
+**/service_account*.json
+**/client_secret*.json
+
+# Identidad, mensajes, archivos y sesiones de WhatsApp
+/data/
+**/data/
+.wwebjs_auth/
+.wwebjs_cache/
+**/.wwebjs_auth/
+**/.wwebjs_cache/
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Claves privadas, certificados con clave privada y backups
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.bak
+*.backup
+*.age
+*.gpg
+*.log
+.ticketbridge-backups/
+**/whatsapp-session-backups/
+**/backup*/
+
+# Temporales
+.DS_Store
+__pycache__/
+*.pyc
+.idea/
+.vscode/.env
+
+# Credenciales
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Datos privados de W-Ticket
+data/
+.wwebjs_auth/
+.wwebjs_cache/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# Archivos temporales
+node_modules/
+.next/
+*.log
+*.bak
+*.bak-*
+*.zip

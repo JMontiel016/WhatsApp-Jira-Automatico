@@ -1,0 +1,4 @@
+#!/bin/sh
+# Bloquea secretos y archivos sensibles antes de registrar nuevos cambios.
+cd "$(git rev-parse --show-toplevel 2>/dev/null)" || exit 1
+node scripts/seguridad-local.cjs staged
