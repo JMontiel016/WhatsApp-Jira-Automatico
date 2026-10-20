@@ -61,10 +61,11 @@ async function jiraCustomFields(base:string,auth:string,clientName:string,system
  }
  return {fields:mapped,warnings};
 }
-export async function jiraCreate(c:{id:number;customer:string;phone:string;message:string;local_date:string;local_time:string;reason:string;source?:string}, options?:{title?:string;assigneeId?:string;reporterId?:string;parentKey?:string;customerName?:string;system?:string}){
+export async function jiraCreate(c:{id:number;customer:string;phone:string;message:string;local_date:string;local_time:string;reason:string;source?:string}, options?:{title?:string;assigneeId?:string;reporterId?:string;parentKey?:string;customerName?:string;system?:string;projectKey?:string}){
   if (process.env.ENABLE_REAL_JIRA!=='true') throw new Error('Creación real desactivada: ENABLE_REAL_JIRA=false');
   const {base,auth}=config();
-  const project=process.env.JIRA_PROJECT_KEY||'CW';
+  const project=options?.projectKey||process.env.JIRA_PROJECT_KEY||'CW';
+  if(!/^[A-Z][A-Z0-9_]{1,19}$/.test(project))throw new Error('Espacio Jira inválido');
   const issuetype=options?.parentKey ? (process.env.JIRA_SUBTASK_TYPE_ID||'10592') : (process.env.JIRA_ISSUE_TYPE_ID||'10595');
   const text=c.source==='whatsapp'?c.message:`Cliente: ${c.customer}\nFecha: ${c.local_date} ${c.local_time}\nMensaje: ${c.message}`;
   const fields:Record<string,unknown>={project:{key:project},issuetype:{id:issuetype},summary:options?.title || `[${c.source==='whatsapp'?'WHATSAPP':'SIMULADOR'}] ${c.message.replace(/\s+/g,' ').slice(0,110)}`,description:{type:'doc',version:1,content:[{type:'paragraph',content:text.split(/\r?\n/).flatMap((line,i)=>[...(i?[{type:'hardBreak'}]:[]),...(line?[{type:'text',text:line}]:[])])}]},labels:[c.source==='whatsapp'?'whatsapp-real':'whatsapp-simulador','ticketbridge'],priority:{id:'3'}};

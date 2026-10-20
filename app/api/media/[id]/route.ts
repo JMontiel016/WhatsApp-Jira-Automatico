@@ -15,7 +15,7 @@ export async function GET(request:NextRequest,{params}:{params:Promise<{id:strin
  try{
   const stats=fs.statSync(filepath);
   if(!stats.isFile()||stats.size<1)return new NextResponse('Archivo no disponible',{status:404});
-  const mime=row.media_type;
+  const mime=(!row.media_type||row.media_type==='application/octet-stream')&&/\.(ogg|opus)$/i.test(filename)?'audio/ogg':row.media_type;
   const inline=mime.startsWith('image/')||mime.startsWith('video/')||mime.startsWith('audio/')||mime==='application/pdf';
   const headers:Record<string,string>={
    'Content-Type':mime,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff',

@@ -1892,25 +1892,22 @@ const server = http.createServer(async (request, response) => {
         contactsResult.status === 'rejected' ? errorText(contactsResult.reason) : '');
       response.setHeader('X-TicketBridge-Contacts-Mode', partial ? 'partial' : 'whatsapp');
       const found = new Map();
-      for(const chat of chats){
-        const id=chatId(chat);
-        if(!validConversationId(id))continue;
-        rememberChat(id);
-        const phone=validGroupChatId(id)?id:id.split('@')[0];
-        found.set(phone,{phone,chatId:id,name:String(chat.name||phone).slice(0,120),isGroup:Boolean(chat.isGroup),unreadCount:Number(chat.unreadCount)||0});
-      }
+      // Únicamente contactos guardados en la agenda de WhatsApp. No usar chats recientes
+      // ni nombres sugeridos: no prueban que el usuario tenga el número guardado.
       for(const contact of addressBook){
+        if(contact?.isMyContact!==true)continue;
         const id=serializedId(contact?.id) || (contact?.id?.user && contact?.id?.server ? `${contact.id.user}@${contact.id.server}` : '');
         if(!validPrivateChatId(id))continue;
         const phone=id.split('@')[0];
-        if(found.has(phone))continue;
-        const name=String(contact.name||contact.pushname||phone).slice(0,120);
+        const name=String(contact.name||'').trim().slice(0,120);
+        if(!name || name===phone)continue;
         const displayPhone=String(contact.number||'').replace(/\D/g,'');
-        found.set(phone,{phone,chatId:id,name,isGroup:false,unreadCount:0,displayPhone:displayPhone.length>=5&&displayPhone.length<=40?displayPhone:undefined});
+        found.set(phone,{phone,chatId:id,name,isGroup:false,saved:true,displayPhone:displayPhone.length>=5&&displayPhone.length<=40?displayPhone:undefined});
       }
       const contacts=[...found.values()].filter(c=>
         !query || `${c.name} ${c.phone} ${c.displayPhone||''}`.toLowerCase().includes(query)
       ).sort((a,b)=>a.name.localeCompare(b.name,'es')).slice(0,500);
+      // Una respuesta parcial no debe incluir contactos de origen incierto.
       return sendJson(response, 200, contacts);
     }
 
@@ -1923,6 +1920,7 @@ const server = http.createServer(async (request, response) => {
     if (
       ![
         '/send',
+        '/send-contact',
         '/send-media',
         '/forward',
         '/chat-state',
@@ -2364,6 +2362,27 @@ const server = http.createServer(async (request, response) => {
        }catch(error){warning='Archivo enviado, pero falló el guardado local: '+errorText(error);console.warn('[MEDIA] Archivo saliente:',errorText(error));}
        return sendJson(response,200,{sent:true,id,mediaSaved,warning});
       }
+
+    if (route === '/send-contact') {
+      const {phone,chatId:provided,contactPhone}=input||{};
+      if(typeof phone!=='string'||!(/^[0-9]{5,40}$/.test(phone)||validGroupChatId(phone))||
+        typeof contactPhone!=='string'||!/^\d{5,40}$/.test(contactPhone))
+        return sendJson(response,400,{error:'Datos de contacto inválidos'});
+      const list=await client.getContacts();
+      const contact=list.find(c=>c?.isMyContact===true &&
+        validPrivateChatId(serializedId(c?.id)) && serializedId(c.id).split('@')[0]===contactPhone &&
+        String(c.name||'').trim());
+      if(!contact)return sendJson(response,404,{error:'Este contacto no está guardado en la agenda de WhatsApp.'});
+      const target=await resolveSendChatId(phone,provided);
+      const vcard=typeof contact.getVCard==='function'?await contact.getVCard():null;
+      if(!vcard||!/^BEGIN:VCARD/m.test(vcard))return sendJson(response,422,{error:'WhatsApp no devolvió una tarjeta de contacto válida.'});
+      await repairWebMessageKeys();
+      const sent=normalizeMessage(await client.sendMessage(target,vcard,{parseVCards:true,sendSeen:false}));
+      const id=messageId(sent);
+      if(!id)return sendJson(response,502,{error:'Envío sin identificador confirmado; revisá WhatsApp antes de reintentar.'});
+      processMessage(sent,true).catch(err=>console.warn('[CONTACTOS] Registro saliente:',errorText(err)));
+      return sendJson(response,200,{sent:true,id});
+    }
 
     if (route === '/send') {
       const { phone, chatId: provided, text, quotedMessageId } = input;

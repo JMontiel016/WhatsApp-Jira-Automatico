@@ -33,8 +33,7 @@ export async function GET(r:NextRequest){
    headers:{'x-local-connector-secret':secret},cache:'no-store',signal:AbortSignal.timeout(9000)
   });
   const items=await res.json();
-  if(res.ok&&Array.isArray(items)&&items.length>0)return NextResponse.json(items,{headers:{'Cache-Control':'no-store','X-TicketBridge-Contacts-Source':'whatsapp'}});
+  if(res.ok&&Array.isArray(items))return NextResponse.json(items.filter((x:{saved?:boolean})=>x.saved===true),{headers:{'Cache-Control':'no-store','X-TicketBridge-Contacts-Source':'whatsapp'}});
  }catch{/* La agenda en vivo puede demorar aun cuando llegan mensajes. */}
- // Alternativa parcial, claramente identificada: únicamente contactos con mensajes locales de esta cuenta.
- return NextResponse.json(knownLocalContacts(account,q),{headers:{'Cache-Control':'no-store','X-TicketBridge-Contacts-Source':'local'}});
+ return NextResponse.json({error:'La agenda de contactos guardados no está disponible. Reconectá WhatsApp y volvé a buscar.'},{status:503});
 }

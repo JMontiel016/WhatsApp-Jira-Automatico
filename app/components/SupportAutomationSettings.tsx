@@ -6,6 +6,7 @@ import {AUTOMATION_SYSTEM_OPTIONS,AUTOMATION_TEXT_DEFAULTS,AUTOMATION_TEXT_FIELD
 import SupportSimulator from './SupportSimulator';
 import AutomationControlCenter from './AutomationControlCenter';
 import GuardiaContacts from './GuardiaContacts';
+import SupportRoster from './SupportRoster';
 import {emptyTeam,TEAM_ROLES,type JiraPerson,type JiraTeam,type TeamRole} from '@/lib/jira-team';
 import {EXTRA_SYSTEMS,parseExtraFields,type ExtraField,type ExtraSystem} from '@/lib/automation-extra-fields';
 
@@ -163,6 +164,7 @@ export default function SupportAutomationSettings({onOpenExcluded}:SupportAutoma
   </div>
   <div className="twSupportFlow">{form.flow.shortForm?'Soporte TI · '+(form.flow.startMode==='first'?'Primer mensaje':'SOPORTE / MENÚ')+' · Sistema · Inconveniente · '+(form.flow.confirmation?'Confirmar · ':'')+'Jira':'Soporte TI · Menú · Datos · Evidencias · Confirmación · Jira'}</div>
   <div id="wtEquipo" className="wtSectionAnchor">
+  <SupportRoster/>
   <div className="wtAssistantSectionHead"><span className="wtAssistantStep">03</span><div><h3>Equipo de soporte</h3><p>Una sola configuración para N1, N2 y Encargado: Jira, contacto y guardias.</p></div></div>
   <section className="twSupportTeamSection" aria-label="Equipo de soporte"><header className="twSimpleHeader twSupportTeamHeader"><Users size={18}/><div><h3>Equipo de soporte</h3><p>Configurá las personas, sus usuarios de Jira y contactos de WhatsApp en un solo lugar.</p></div><span className="twTeamCount">{roles.filter(role=>form.team[role].id).length}/3 en Jira</span></header><div className="twSupportTeamBody">
   <div className="automationTeamGrid">

@@ -34,7 +34,14 @@ export async function syncTicketEvidence(key:string,messageIds:number[],manualRe
  WHERE t.jira_key=? AND t.status='created' AND c.id IN (${ids.map(()=>'?').join(',')})
  ORDER BY c.id`;
  const rows=db.prepare(query).all(key,...ids) as FileRow[];
- const files=rows.filter(r=>r.media_path&&r.media_type);
+ const files=rows.filter(r=>{
+  if(!(r.media_path&&r.media_type))return false;
+  const type=(r.media_type||'').toLowerCase();
+  const name=(r.media_name||'').toLowerCase();
+  if(type.startsWith('audio/'))return false;
+  if(/\.(ogg|opus|mp3|m4a|wav|aac)$/i.test(name))return false;
+  return true;
+ });
  if(!files.length)return result;
  // Consultar archivos de Jira antes de reintentar, incluidos los que pudieran
  // haberse subido antes de instalar este ajuste.

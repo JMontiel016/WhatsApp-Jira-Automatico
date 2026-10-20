@@ -1,3 +1,4 @@
+import {notifySupportRoster} from '@/lib/support-roster-notify';
 import fs from 'node:fs';
 import path from 'node:path';
 import { database, type CaseRecord } from './db';
@@ -266,6 +267,7 @@ async function createTicket(s:Session,lastId:number){
    rows.forEach(row=>link.run(s.ticket_id,row.id));
   })();
   advance(s,'done',info);
+  void notifySupportRoster(result.key,title).catch(e=>console.warn('[MATTERMOST] Aviso interno pendiente:',e));
   if(result.fieldWarnings?.length)console.warn('[JIRA] Advertencias de campos:',result.key,result.fieldWarnings.join(' | '));
   // No agregamos watchers automáticamente a los otros niveles: solamente
   // el nivel de atención elegido recibe enlace, si habilitó WhatsApp.
