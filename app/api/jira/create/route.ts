@@ -3,6 +3,7 @@ import {z} from 'zod';
 import {database,CaseRecord} from '@/lib/db';
 import {jiraCreate} from '@/lib/jira';
 import {syncTicketEvidence} from '@/lib/jira-evidence';
+import {formatManualTicketDescription} from '@/lib/manual-ticket-description';
 import {notifySupportRoster} from '@/lib/support-roster-notify';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -63,7 +64,7 @@ export async function POST(r:NextRequest){
     const created=d.prepare("INSERT INTO customer_jira_tickets(phone,kind,parent_key,title,assignee_id,assignee_name,status) VALUES (?,?,?,?,?,?,'sending')").run(phone,mode,mode==='subtask'?p.data.parentKey:null,title,p.data.assigneeId||null,p.data.assigneeId?(p.data.assigneeName||null):null);
     const recordId=Number(created.lastInsertRowid);
     const evidenceNote=stillMissing.length?`\nEvidencia no recuperada: ${stillMissing.length} archivo(s) originales no estaban disponibles en WhatsApp al crear este ticket.`:'';
-    const body=((p.data.description!==undefined?p.data.description:chosen.map(m=>`[${m.local_date} ${m.local_time}] ${m.message}`).join('\n'))+
+    const body=((p.data.description!==undefined?p.data.description:formatManualTicketDescription(chosen))+
       (chosenReady.some(m=>hasFile(m))?'\nEvidencia en archivos adjuntos: '+chosenReady.filter(m=>hasFile(m)).map(m=>(m.media_source==='manual'?'[aportado manualmente] ':'')+(m.media_name||('Archivo del mensaje '+m.id))).join(', '):'')+evidenceNote).slice(0,19000);
     const first=chosen[0];
     let issue:{key:string,id:string;fieldWarnings?:string[]};
