@@ -1,10 +1,28 @@
-import {NextResponse} from 'next/server';
+import {NextRequest,NextResponse} from 'next/server';
 import {database} from '@/lib/db';
+import {linkedAccount} from '@/lib/active-account';
 export const runtime='nodejs';export const dynamic='force-dynamic';
-export async function GET(){
+export async function GET(request:NextRequest){
  const d=database();
+ const account=await linkedAccount();
+ if(!account)return NextResponse.json([],{headers:{'Cache-Control':'no-store'}});
+ // Solo mostramos mensajes propiedad de la cuenta WhatsApp vinculada.
+ // getChats() puede atascarse sin que la sesión deje de estar conectada.
+ // Un fallo transitorio del snapshot NO debe vaciar el historial SQLite.
+ // Tampoco se asume que la ausencia de un chat en getChats() equivale a borrado.
+ let snapshotState:'live'|'unavailable'='unavailable';
+ try{
+  const secret=process.env.WHATSAPP_LOCAL_SECRET||'';
+  if(secret.length>=24){
+   const response=await fetch('http://127.0.0.1:3217/chats-snapshot'+(request.nextUrl.searchParams.get('fresh')==='1'?'?fresh=1':''),{headers:{'x-local-connector-secret':secret},cache:'no-store',signal:AbortSignal.timeout(6500)});
+   if(response.ok){
+    const snapshot=await response.json() as {accountId?:string;phones?:string[]};
+    if(snapshot.accountId===account&&Array.isArray(snapshot.phones))snapshotState='live';
+   }
+  }
+ }catch{/* Mostrar historial local, sin inventar estado remoto. */}
  // Ocultar avisos técnicos importados de versiones anteriores; no borrar registros.
- const events=d.prepare("SELECT id,phone,customer,message,received_at,local_date,local_time,reason,outside_hours,status,jira_key,source,media_path,media_type,media_name,media_error,media_source,has_media,direction,wa_message_id,wa_ack,is_group,sender_name FROM cases WHERE source='whatsapp' AND NOT (has_media=0 AND (message LIKE '[Adjunto WhatsApp: notification_template]%' OR message LIKE '[Adjunto WhatsApp: gp2]%' OR message LIKE '[Adjunto WhatsApp: notification]%' OR message LIKE '[Adjunto WhatsApp: e2e_notification]%')) ORDER BY received_at ASC,id ASC").all() as Array<Record<string,any>>;
+ const events=d.prepare("SELECT id,phone,customer,message,received_at,local_date,local_time,reason,outside_hours,status,jira_key,source,media_path,media_type,media_name,media_error,media_source,has_media,direction,wa_message_id,wa_ack,is_group,sender_name FROM cases WHERE source='whatsapp' AND account_id=? AND NOT (has_media=0 AND (message LIKE '[Adjunto WhatsApp: notification_template]%' OR message LIKE '[Adjunto WhatsApp: gp2]%' OR message LIKE '[Adjunto WhatsApp: notification]%' OR message LIKE '[Adjunto WhatsApp: e2e_notification]%')) ORDER BY received_at ASC,id ASC").all(account) as Array<Record<string,any>>;
  const rRows=d.prepare('SELECT wa_message_id,actor_id,emoji FROM message_reactions').all() as Array<{wa_message_id:string;actor_id:string;emoji:string}>;
  const reactions=new Map<string,Array<{actor_id:string;emoji:string}>>();
  for(const r of rRows){const prev=reactions.get(r.wa_message_id)||[];prev.push({actor_id:r.actor_id,emoji:r.emoji});reactions.set(r.wa_message_id,prev);}
@@ -17,8 +35,8 @@ export async function GET(){
  const flags=d.prepare('SELECT message_id,pinned,starred,note FROM message_flags').all() as Array<{message_id:number;pinned:number;starred:number;note:string}>;
  const byFlag=new Map(flags.map(f=>[f.message_id,f]));
  for(const e of events){const m=byFlag.get(e.id);e.message_pinned=Boolean(m?.pinned);e.message_starred=Boolean(m?.starred);e.message_note=m?.note||'';}
- const tickets=d.prepare('SELECT * FROM conversation_tickets').all() as Array<{phone:string,jira_key:string|null,status:string,error:string|null}>;
- const history=d.prepare("SELECT * FROM customer_jira_tickets WHERE status='created' ORDER BY CAST(SUBSTR(jira_key, INSTR(jira_key, '-') + 1) AS INTEGER) DESC, id DESC").all() as Array<{id:number,phone:string,jira_key:string,title:string,kind:string,parent_key:string|null,created_at:string}>;
+ const tickets=d.prepare('SELECT * FROM conversation_tickets WHERE phone IN (SELECT phone FROM cases WHERE account_id=?)').all(account) as Array<{phone:string,jira_key:string|null,status:string,error:string|null}>;
+ const history=d.prepare("SELECT * FROM customer_jira_tickets WHERE status='created' AND id IN (SELECT ticket_id FROM customer_ticket_messages WHERE message_id IN (SELECT id FROM cases WHERE account_id=?)) ORDER BY CAST(SUBSTR(jira_key, INSTR(jira_key, '-') + 1) AS INTEGER) DESC, id DESC").all(account) as Array<{id:number,phone:string,jira_key:string,title:string,kind:string,parent_key:string|null,created_at:string}>;
  const linked=d.prepare('SELECT message_id FROM customer_ticket_messages').all() as Array<{message_id:number}>;const linkedIds=new Set(linked.map(x=>x.message_id));
  // La vinculación es informativa: el operador puede volver a seleccionar una evidencia para un ticket diferente.
  for(const e of events)e.usedInTicket=linkedIds.has(e.id);
@@ -33,5 +51,5 @@ export async function GET(){
  // No inventar un mensaje nuevo por haber marcado manualmente como no leído.
  // La marca se representa con un punto y unread_count refleja SOLO mensajes entrantes nuevos.
 
- return NextResponse.json([...map.values()].sort((a,b)=>Number(b.pinned)-Number(a.pinned)||b.events[b.events.length-1].received_at.localeCompare(a.events[a.events.length-1].received_at)),{headers:{'Cache-Control':'no-store'}});
+ return NextResponse.json([...map.values()].sort((a,b)=>Number(b.pinned)-Number(a.pinned)||b.events[b.events.length-1].received_at.localeCompare(a.events[a.events.length-1].received_at)),{headers:{'Cache-Control':'no-store','X-TicketBridge-Snapshot':snapshotState}});
 }

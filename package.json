@@ -1,5 +1,5 @@
 {
-  "name": "whatsapp-jira-local",
+  "name": "ticketwhatsapp",
   "version": "1.0.0",
   "private": true,
   "scripts": {
@@ -7,7 +7,16 @@
     "build": "next build",
     "start": "next start -H 127.0.0.1 -p 3000",
     "whatsapp": "node whatsapp/connector.cjs",
-    "postinstall": "node scripts/reparar-whatsapp.cjs"
+    "postinstall": "node scripts/reparar-whatsapp.cjs",
+    "verificar": "node scripts/verificar.cjs",
+    "limpiar": "bash limpiar-caches-seguro.sh --aplicar",
+    "test:automation": "node tests/test_flow.cjs",
+    "test:level2": "node tests/test_level2.cjs",
+    "test:studio": "node tests/test_ticketbridge_studio.cjs",
+    "diagnostico:qr": "node scripts/diagnosticar-vinculacion.cjs",
+    "test:qr-recovery": "node tests/test_whatsapp_recovery.cjs",
+    "test:qa": "node tests/test_instalacion_nueva.cjs && node tests/test_guardias.cjs && node tests/test_ticketbridge_automatizacion.cjs && node tests/test_cloud_menu.cjs",
+    "diagnostico:visibilidad": "node scripts/verificar-visibilidad-segura.cjs"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

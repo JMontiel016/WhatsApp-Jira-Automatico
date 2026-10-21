@@ -1,5 +1,7 @@
 import {NextRequest,NextResponse} from 'next/server';
 import {database} from '@/lib/db';
+import {linkedAccount} from '@/lib/active-account';
+import {markManualOutreach} from '@/lib/automation-controls';
 import {z} from 'zod';
 import {rejectCrossOrigin} from '@/lib/security';
 export const runtime='nodejs';
@@ -43,6 +45,11 @@ export async function POST(req:NextRequest){
   const result=await response.json().catch(()=>({error:'El conector no devolvió una respuesta válida'})) as {sent?:boolean;error?:string;id?:string|null};
   if(!response.ok)return NextResponse.json({error:result.error||`WhatsApp rechazó el envío (HTTP ${response.status})`},{status:response.status});
   if(result.sent!==true)return NextResponse.json({error:'WhatsApp no confirmó el envío. Revisá la conversación antes de reintentar.'},{status:502});
+  // El envío fue confirmado por WhatsApp. Evitar que el bot fuerce el formulario
+  // cuando un operador ya tomó la conversación; NUNCA aplica a envíos del bot.
+  if(!phone.endsWith('@g.us')){
+   try{const account=await linkedAccount();if(account)markManualOutreach(account,phone);}catch(error){console.warn('[BOT] No se pudo registrar atención humana:',error);}
+  }
   return NextResponse.json({sent:true,id:result.id||null});
  }catch(error){
   const timeout=error instanceof Error && (error.name==='TimeoutError'||error.name==='AbortError');

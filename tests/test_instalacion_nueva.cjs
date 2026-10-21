@@ -1,0 +1,13 @@
+'use strict';
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const path=require('node:path');
+const root=path.resolve(__dirname,'..');
+const read=f=>fs.readFileSync(path.join(root,f),'utf8');
+for(const name of ['whatsapp/connector.cjs','app/api/diagnostics/visibility/route.ts', 'app/api/conversations/route.ts','app/api/tickets/route.ts','scripts/reparar-whatsapp.cjs','app/components/SupportAutomationSettings.tsx','importar_desde_original.py']) assert.ok(fs.existsSync(path.join(root,name)),name);
+assert.match(read('whatsapp/connector.cjs'),/ticketbridge-sync-v6\.7-sync/);
+assert.match(read('lib/whatsapp-version.ts'),/ticketbridge-sync-v6\.7-sync/);
+assert.match(read('app/api/whatsapp/read-sync/route.ts'),/skipped:true/);
+assert.match(read('app/api/diagnostics/visibility/route.ts'),/unassignedMessages/);
+assert.match(read('app/components/SupportAutomationSettings.tsx'),/twSupportTeamSection/);
+console.log('[OK] Código íntegro, conector incluido, equipo de soporte unificado y diagnóstico seguro.');

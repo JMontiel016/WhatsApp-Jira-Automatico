@@ -3,17 +3,20 @@ import {z} from 'zod';
 import {database,CaseRecord} from '@/lib/db';
 import {jiraCreate} from '@/lib/jira';
 import {syncTicketEvidence} from '@/lib/jira-evidence';
+import {formatManualTicketDescription} from '@/lib/manual-ticket-description';
+import {notifySupportRoster} from '@/lib/support-roster-notify';
 import fs from 'node:fs';
 import path from 'node:path';
 import {rejectCrossOrigin} from '@/lib/security';
 export const runtime='nodejs';
 export async function POST(r:NextRequest){
   const denied=rejectCrossOrigin(r);if(denied)return denied;
-  const p=z.object({id:z.number().int().positive().optional(),phone:z.string().min(5).max(60).optional(),messageIds:z.array(z.number().int().positive()).min(1).max(500).optional(),title:z.string().trim().min(5).max(180).optional(),customer:z.string().trim().max(120).optional(),kind:z.enum(['issue','subtask']).optional(),parentKey:z.string().regex(/^CW-[0-9]+$/).optional(),system:z.enum(['Futura100','Talento100','Otros sistemas']).optional(),assigneeId:z.string().min(4).max(160).optional(),assigneeName:z.string().trim().max(120).optional(),allowMissingEvidence:z.boolean().optional(),allowUnconfirmedJira:z.boolean().optional()}).refine(v=>!!v.id!==!!v.phone).safeParse(await r.json().catch(()=>null));if(!p.success)return NextResponse.json({error:'ID inválido'},{status:400});
+  const p=z.object({id:z.number().int().positive().optional(),phone:z.string().min(5).max(60).optional(),messageIds:z.array(z.number().int().positive()).min(1).max(500).optional(),title:z.string().trim().min(5).max(180).optional(),customer:z.string().trim().max(120).optional(),kind:z.enum(['issue','subtask']).optional(),projectKey:z.string().regex(/^[A-Z][A-Z0-9_]{1,19}$/).optional(),description:z.string().max(18000).optional(),reporterId:z.string().max(160).optional(),parentKey:z.string().regex(/^[A-Z][A-Z0-9_]{1,19}-[0-9]+$/).optional(),system:z.enum(['Futura100','Talento100','Otros sistemas']).optional(),assigneeId:z.string().min(4).max(160).optional(),assigneeName:z.string().trim().max(120).optional(),allowMissingEvidence:z.boolean().optional(),allowUnconfirmedJira:z.boolean().optional()}).refine(v=>!!v.id!==!!v.phone).safeParse(await r.json().catch(()=>null));if(!p.success)return NextResponse.json({error:'ID inválido'},{status:400});
   const d=database();
   if(p.data.phone){
     const phone=p.data.phone;
     const mode=p.data.kind||'issue';
+    if(mode==='subtask'&&p.data.parentKey&&!p.data.parentKey.startsWith((p.data.projectKey||process.env.JIRA_PROJECT_KEY||'CW')+'-'))return NextResponse.json({error:'El ticket padre debe pertenecer al espacio seleccionado'},{status:400});
     if(mode==='subtask'&&!p.data.parentKey)return NextResponse.json({error:'Seleccioná el ticket padre para la subtarea'},{status:400});
     const subject=p.data.title?.trim();if(!subject)return NextResponse.json({error:'Escribí el tema del inconveniente'},{status:400});
     const dbClient=d.prepare('SELECT name FROM contact_profiles WHERE phone=?').get(phone) as {name:string|null}|undefined;
@@ -61,12 +64,12 @@ export async function POST(r:NextRequest){
     const created=d.prepare("INSERT INTO customer_jira_tickets(phone,kind,parent_key,title,assignee_id,assignee_name,status) VALUES (?,?,?,?,?,?,'sending')").run(phone,mode,mode==='subtask'?p.data.parentKey:null,title,p.data.assigneeId||null,p.data.assigneeId?(p.data.assigneeName||null):null);
     const recordId=Number(created.lastInsertRowid);
     const evidenceNote=stillMissing.length?`\nEvidencia no recuperada: ${stillMissing.length} archivo(s) originales no estaban disponibles en WhatsApp al crear este ticket.`:'';
-    const body=(chosen.map(m=>`[${m.local_date} ${m.local_time}] ${m.message}`).join('\n')+
+    const body=((p.data.description!==undefined?p.data.description:formatManualTicketDescription(chosen))+
       (chosenReady.some(m=>hasFile(m))?'\nEvidencia en archivos adjuntos: '+chosenReady.filter(m=>hasFile(m)).map(m=>(m.media_source==='manual'?'[aportado manualmente] ':'')+(m.media_name||('Archivo del mensaje '+m.id))).join(', '):'')+evidenceNote).slice(0,19000);
     const first=chosen[0];
     let issue:{key:string,id:string;fieldWarnings?:string[]};
     try{
-      issue=await jiraCreate({...first,customer:customerName,message:body,source:'whatsapp'},{title,customerName,system:p.data.system||'Otros sistemas',assigneeId:p.data.assigneeId,parentKey:mode==='subtask'?p.data.parentKey:undefined});
+      issue=await jiraCreate({...first,customer:customerName,message:body,source:'whatsapp'},{title,customerName,system:p.data.system||'Otros sistemas',assigneeId:p.data.assigneeId,reporterId:p.data.reporterId,projectKey:p.data.projectKey,parentKey:mode==='subtask'?p.data.parentKey:undefined});
       d.transaction(()=>{
         d.prepare("UPDATE customer_jira_tickets SET status='created',jira_key=?,jira_id=? WHERE id=?").run(issue.key,issue.id,recordId);
         const link=d.prepare('INSERT INTO customer_ticket_messages(ticket_id,message_id) VALUES (?,?)');for(const m of chosen)link.run(recordId,m.id);
@@ -74,7 +77,15 @@ export async function POST(r:NextRequest){
     }catch(e){const error=e instanceof Error?e.message:'Error inesperado';d.prepare("UPDATE customer_jira_tickets SET status='review',error=? WHERE id=?").run(error,recordId);return NextResponse.json({error,review:true},{status:502});}
     // Sincroniza también las fotos recuperadas después; cada evidencia tiene
     // control de idempotencia por ticket y mensaje.
-    const uploaded=await syncTicketEvidence(issue.key,ids);
+    // Jira YA confirmó el ticket. Si la consulta/subida de adjuntos falla,
+    // nunca devolver HTTP 500 por esta fase: el operador reintentaría y
+    // podría crear un segundo ticket sin saber que el primero sí existe.
+    let uploaded;
+    try { uploaded=await syncTicketEvidence(issue.key,ids); }
+    catch(e){
+      uploaded={uploaded:0,already:0,pending:0,errors:[`Ticket creado; no se pudieron confirmar las evidencias: ${e instanceof Error?e.message:'error desconocido'}`]};
+    }
+    await notifySupportRoster(issue.key,title);
     return NextResponse.json({ok:true,key:issue.key,id:issue.id,attachments:uploaded,fieldWarnings:issue.fieldWarnings||[],missingEvidence:stillMissing.map(m=>m.id)});
   }
   const item=d.prepare('SELECT * FROM cases WHERE id=?').get(p.data.id) as CaseRecord|undefined;

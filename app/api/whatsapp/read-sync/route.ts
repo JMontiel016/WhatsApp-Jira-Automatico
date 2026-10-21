@@ -4,13 +4,13 @@ import {requireWhatsAppConnector} from '@/lib/whatsapp-version';
 export const runtime='nodejs'; export const dynamic='force-dynamic';
 export async function GET(){
  const check=await requireWhatsAppConnector();
- if(!check.ok)return NextResponse.json({error:check.error},{status:check.status});
+ if(!check.ok)return NextResponse.json({ok:false,skipped:true,reason:check.error},{headers:{'Cache-Control':'no-store'}});
  const secret=process.env.WHATSAPP_LOCAL_SECRET||'';
  if(secret.length<24)return NextResponse.json({error:'Falta el secreto del conector'},{status:503});
  try{
   const res=await fetch('http://127.0.0.1:3217/read-snapshot',{headers:{'x-local-connector-secret':secret},cache:'no-store',signal:AbortSignal.timeout(14000)});
   const result=await res.json() as {chats?:Array<{phone:string;unreadCount:number;lastOutgoingAt?:number|null}>;error?:string};
-  if(!res.ok||!Array.isArray(result.chats))return NextResponse.json({error:result.error||'No se pudo leer estado de chats'},{status:502});
+  if(!res.ok||!Array.isArray(result.chats))return NextResponse.json({ok:false,skipped:true,reason:result.error||'La lectura remota no está disponible. Los chats locales siguen disponibles.'},{headers:{'Cache-Control':'no-store'}});
   const d=database();
   const latest=d.prepare("SELECT MAX(received_at) AS last_date FROM cases WHERE source='whatsapp' AND phone=? AND direction='in'");
   const unreadLocal=d.prepare("SELECT COUNT(*) AS amount FROM cases WHERE source='whatsapp' AND phone=? AND direction='in' AND received_at>?");
@@ -46,5 +46,5 @@ export async function GET(){
   });
   update(result.chats);
   return NextResponse.json({ok:true,synced:result.chats.length},{headers:{'Cache-Control':'no-store'}});
- }catch(e){return NextResponse.json({error:e instanceof Error?e.message:'Sin conexión con WhatsApp'},{status:503});}
+ }catch(e){return NextResponse.json({ok:false,skipped:true,reason:e instanceof Error?e.message:'No fue posible leer los vistos remotos'},{headers:{'Cache-Control':'no-store'}});}
 }

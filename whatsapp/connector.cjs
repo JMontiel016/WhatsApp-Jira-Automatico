@@ -94,6 +94,36 @@ fs.mkdirSync(DATA_DIR, {
 // ========================================
 
 let ready = false;
+let connectionPhase = 'starting';
+let historySync = 'waiting';
+let pairingQr = null;
+let pairingQrAt = 0;
+// La regeneración solo se solicita manualmente; evita bucles de Chromium.
+let qrRefreshInFlight = false;
+let lastQrRefresh = 0;
+let lastQrError = '';
+let clientStartingAt = Date.now();
+let browserStallWarned = false;
+const BROWSER_STARTUP_WARNING_MS = 90000;
+const QR_REFRESH_COOLDOWN_MS = 30000;
+// Un QR caduca: no puede bloquear indefinidamente el watchdog.
+const QR_DISPLAY_MAX_AGE_MS = 60000;
+const QR_STALE_RECOVERY_MS = 120000;
+function currentQrAvailable() {
+  return !ready && typeof pairingQr === 'string' && pairingQr.length > 0 &&
+    pairingQrAt > 0 && Date.now() - pairingQrAt < QR_DISPLAY_MAX_AGE_MS;
+}
+function qrExpired() {
+  return !ready && pairingQrAt > 0 &&
+    Date.now() - pairingQrAt >= QR_DISPLAY_MAX_AGE_MS;
+}
+function qrStalled() {
+  return !ready && pairingQrAt > 0 &&
+    Date.now() - pairingQrAt >= QR_STALE_RECOVERY_MS;
+}
+// Diagnóstico de arranque sin acceso al contenido de chats ni al QR.
+let lastBrowserObservation = '';
+let browserObservationAt = 0;
 let compatibility = 'pending';
 
 let seen = new Set();
@@ -293,20 +323,115 @@ function rememberChat(id) {
 // CLIENTE WHATSAPP
 // ========================================
 
-const client = new Client({
-  authStrategy: new LocalAuth({
-    clientId: 'ticketbridge-test',
-    dataPath: path.join(DATA_DIR, '.wwebjs_auth')
-  }),
-
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox'
-    ]
+// Las vinculaciones nuevas SIEMPRE utilizan un cliente nuevo. Reutilizar
+// initialize() después de destroy() deja Puppeteer/LocalAuth en un estado
+// indeterminado y puede bloquear el QR hasta reiniciar Node.
+const LOCAL_AUTH_CLIENT_ID = 'ticketbridge-test';
+const AUTH_ROOT = path.join(DATA_DIR, '.wwebjs_auth');
+const AUTH_SESSION = path.join(AUTH_ROOT, `session-${LOCAL_AUTH_CLIENT_ID}`);
+const AUTH_BACKUPS = path.join(DATA_DIR, 'whatsapp-session-backups');
+const AUTO_RESTART_AFTER_MS = 180000;
+const clientHandlers = [];
+function clientOptions() {
+  return {
+    authStrategy: new LocalAuth({clientId: LOCAL_AUTH_CLIENT_ID, dataPath: AUTH_ROOT}),
+    authTimeoutMs: 120000,
+    // La biblioteca renueva periódicamente el QR; no agotar los reintentos.
+    qrMaxRetries: 0,
+    puppeteer: {
+      headless: process.env.WHATSAPP_BROWSER_VISIBLE !== 'true',
+      protocolTimeout: 240000,
+      timeout: 120000,
+      ...(process.env.WHATSAPP_CHROME_PATH ? {executablePath:process.env.WHATSAPP_CHROME_PATH} : {}),
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    }
+  };
+}
+let client = new Client(clientOptions());
+// Las once suscripciones se registran en el cliente activo. Al reiniciar,
+// no se vuelven a registrar listeners en la instancia antigua.
+function bindClientListener(target, event, handler) {
+  target.on(event, (...args) => {
+    if (client !== target || closing) return;
+    return handler(...args);
+  });
+}
+function onClient(event, handler) {
+  clientHandlers.push([event, handler]);
+  bindClientListener(client, event, handler);
+}
+function replaceClient() {
+  const next = new Client(clientOptions());
+  client = next;
+  for (const [event, handler] of clientHandlers) bindClientListener(next, event, handler);
+  return next;
+}
+let restartCount = 0;
+let automaticRestartUsed = false;
+let restartReason = '';
+let initializationInFlight = false;
+let restartScheduled = false;
+let closing = false;
+// Se exportan helpers sin acoplarlos a WhatsApp, para probar los límites de
+// recuperación incluso sin acceso a una cuenta real.
+const { stopClientBounded, backupAuthSession } = require('./session-recovery.cjs');
+function initializeActiveClient() {
+  const current = client;
+  ready = false;
+  initializationInFlight = true;
+  clientStartingAt = Date.now();
+  connectionPhase = 'starting';
+  lastQrError = '';
+  pairingQr = null;
+  pairingQrAt = 0;
+  historySync = 'waiting';
+  console.log('[WHATSAPP] Inicializando WhatsApp Web; esperá autenticación o QR.');
+  console.log('[WHATSAPP] Navegador:', process.env.WHATSAPP_BROWSER_VISIBLE === 'true' ? 'visible' : 'sin ventana',
+    '| sesión local conservada:', fs.existsSync(AUTH_SESSION));
+  // Si no se emite QR, informar si el navegador siquiera pudo abrir una página.
+  lastBrowserObservation = 'Inicialización solicitada a whatsapp-web.js';
+  browserObservationAt = Date.now();
+  Promise.resolve().then(() => current.initialize()).catch(error => {
+    if (client !== current || closing) return;
+    connectionPhase = 'initialization_error';
+    lastQrError = 'Error inicializando WhatsApp: ' + errorText(error);
+    console.error('[WHATSAPP]', lastQrError);
+  }).finally(() => { if(client === current) initializationInFlight = false; });
+}
+async function restartWhatsApp({reason='manual', resetSession=false}={}) {
+  if (qrRefreshInFlight || closing) return {ok:false, error:'Reinicio en curso'};
+  if (ready) return {ok:false, error:'La cuenta ya está conectada'};
+  qrRefreshInFlight = true;
+  connectionPhase = 'restarting';
+  pairingQr = null; pairingQrAt = 0;
+  lastQrError = '';
+  browserStallWarned = false;
+  restartReason = reason;
+  try {
+    const previous = client;
+    const closed = await stopClientBounded(previous, 12000);
+    if (!closed) throw new Error('No se pudo detener el navegador anterior. Reiniciá npm run whatsapp para liberar el perfil sin perder la sesión.');
+    if (resetSession) {
+      const backup = backupAuthSession({sessionDir:AUTH_SESSION,backupDir:AUTH_BACKUPS});
+      if (backup) console.log('[WHATSAPP] Sesión anterior resguardada en:', backup);
+    }
+    clearWhatsAppReadCache();
+    recentMediaHistory.clear();
+    compatibility = 'pending';
+    restartCount += 1;
+    replaceClient();
+    initializeActiveClient();
+    return {ok:true};
+  } catch(error) {
+    connectionPhase='initialization_error';
+    // No borrar el perfil. Mostrar la falla para recuperación manual.
+    lastQrError='No se pudo reiniciar la vinculación: '+errorText(error);
+    console.error('[WHATSAPP]',lastQrError);
+    return {ok:false,error:lastQrError};
+  } finally {
+    qrRefreshInFlight=false;
   }
-});
+}
 
 // ========================================
 // COMPATIBILIDAD DE IDENTIFICADORES
@@ -389,7 +514,17 @@ async function repairWebMessageKeys() {
 // EVENTOS DE CONEXIÓN
 // ========================================
 
-client.on('qr', qr => {
+onClient('loading_screen', (progress, message) => {
+  if(!ready && connectionPhase !== 'scan')connectionPhase='loading';
+  if(progress===100 || progress===0)console.log('[WHATSAPP] Cargando WhatsApp Web:', progress, String(message||'').slice(0,70));
+});
+onClient('qr', qr => {
+  browserStallWarned = false;
+  connectionPhase = 'scan';
+  pairingQr = qr;
+  clearWhatsAppReadCache();
+  pairingQrAt = Date.now();
+  lastQrError = '';
   console.log(
     '[WHATSAPP] Escaneá el QR desde dispositivos vinculados.'
   );
@@ -397,24 +532,44 @@ client.on('qr', qr => {
   qrcode.generate(qr, { small: true });
 });
 
-client.on('authenticated', () => {
+onClient('authenticated', () => {
+  connectionPhase = 'authenticated';
+  browserStallWarned = false;
+  clearWhatsAppReadCache();
+  pairingQr = null;
+  pairingQrAt = 0;
   console.log('[WHATSAPP] Sesión autenticada.');
 });
 
-client.on('ready', async () => {
+onClient('ready', async () => {
+  connectionPhase = 'synchronizing';
+  browserStallWarned = false;
+  clearWhatsAppReadCache();
+  pairingQr = null;
+  pairingQrAt = 0;
   ready = false;
 
-  await repairWebMessageKeys();
+  let patchTimeout;
+  try {
+    await Promise.race([
+      repairWebMessageKeys(),
+      new Promise(resolve=>{patchTimeout=setTimeout(()=>{console.warn('[WHATSAPP] Reparación multimedia demorada; continuar con la sesión.');resolve(false);},8000);})
+    ]);
+  } finally { clearTimeout(patchTimeout); }
 
   ready = true;
-
-  console.log(
-    '[WHATSAPP] Conectado. Escuchando mensajes.'
-  );
+  connectionPhase = 'connected';
+  console.log('[WHATSAPP] Conectado. Escuchando mensajes.');
+  // Recuperar el historial reciente una vez por sesión; nunca ejecuta el bot.
+  setTimeout(() => { void importTodayVisibleHistory(); }, 3500).unref?.();
 });
 
-client.on('auth_failure', error => {
+onClient('auth_failure', error => {
+  connectionPhase = 'auth_failure';
+  clearWhatsAppReadCache();
+  pairingQr = null;
   ready = false;
+  lastQrError = errorText(error);
 
   console.error(
     '[WHATSAPP] Error de autenticación:',
@@ -422,7 +577,11 @@ client.on('auth_failure', error => {
   );
 });
 
-client.on('disconnected', reason => {
+onClient('disconnected', reason => {
+  connectionPhase = 'disconnected';
+  historySync = 'waiting';
+  clearWhatsAppReadCache();
+  pairingQr = null;
   ready = false;
   recentMediaHistory.clear();
 
@@ -432,7 +591,7 @@ client.on('disconnected', reason => {
   );
 });
 
-client.on('change_state', state => {
+onClient('change_state', state => {
   console.log('[WHATSAPP] Estado:', state);
 });
 
@@ -660,6 +819,26 @@ async function downloadCandidate(message, attempts = 3) {
   );
 }
 
+// Enviar el mensaje explicativo y, si corresponde, la selección tocable.
+// Las encuestas de opción única son compatibles con whatsapp-web.js.
+// Los menús ahora son texto numerado. Se retiraron las encuestas y los votos
+// porque una votación no equivale a un botón de atención al cliente.
+async function sendAutomationReply(payload,result){
+ if(typeof result?.automationReply!=='string'||!result.automationReply.trim())return;
+ if(!ready||!validPrivateChatId(payload.chatId))return;
+ // El interruptor se verifica justo antes del envío. Si se apagó durante
+ // el procesamiento del webhook, no enviar respuestas pendientes.
+ try{
+  const settingRes=await fetch(`${API_BASE}/api/settings`,{cache:'no-store',signal:AbortSignal.timeout(2500)});
+  const setting=settingRes.ok?await settingRes.json():null;
+  if(setting?.automation_enabled!=='1')return;
+ }catch{ return; }
+ try{
+  const sent=normalizeMessage(await client.sendMessage(payload.chatId,result.automationReply,{sendSeen:false}));
+  if(!messageId(sent))console.warn('[BOT] Respuesta enviada sin ID verificable; revisar chat antes de reintentar.');
+ }catch(error){console.error('[BOT] Respuesta no confirmada:',errorText(error));}
+}
+
 // ========================================
 // ENVÍO AL BACKEND LOCAL
 // ========================================
@@ -669,7 +848,7 @@ async function ingest(payload) {
 
   const timeout = setTimeout(
     () => controller.abort(),
-    30000
+    60000
   );
 
   try {
@@ -716,9 +895,13 @@ async function ingest(payload) {
 async function contactDetails(message, sender) {
   let name = '';
   let avatarUrl = '';
+  // Solo isMyContact confirma que está guardado en la agenda propia.
+  // Un nombre o una conversación NO prueban que sea un contacto.
+  let isSavedContact = null;
 
   try {
     const contact = await message.getContact();
+    if (typeof contact?.isMyContact === 'boolean') isSavedContact = contact.isMyContact;
 
     name = String(
       contact?.name ||
@@ -765,7 +948,7 @@ async function contactDetails(message, sender) {
     avatarUrl = '';
   }
 
-  return { name, avatarUrl };
+  return { name, avatarUrl, isSavedContact };
 }
 
 // La descarga no debe impedir que el texto se registre inmediatamente.
@@ -790,6 +973,7 @@ function drainMediaQueue() {
       try {
         const media = await downloadCandidate(job.message, job.retry ? 2 : 3);
         const result = await ingest({ ...job.payload, media, mediaError: '' });
+        await sendAutomationReply(job.payload,result);
         if (result.mediaSaved !== true) {
           throw new Error('El backend no confirmó el guardado del adjunto');
         }
@@ -825,7 +1009,7 @@ function drainMediaQueue() {
 // PROCESAMIENTO DE MENSAJES
 // ========================================
 
-async function processMessage(message, outbound = false) {
+async function processMessage(message, outbound = false, historyOnly = false) {
   normalizeMessage(message);
 
   // Los cambios de integrantes, mensajes de seguridad y notificaciones
@@ -886,7 +1070,7 @@ async function processMessage(message, outbound = false) {
       ? message.body.slice(0, 3000)
       : `[Adjunto WhatsApp: ${message.type || 'archivo'}]`;
 
-    const contact = isGroup ? {name:'', avatarUrl:''} : await contactDetails(message, sender);
+    const contact = isGroup ? {name:'', avatarUrl:'', isSavedContact:null} : await contactDetails(message, sender);
     let groupName = '';
     let senderName = '';
     if (isGroup) {
@@ -909,16 +1093,20 @@ async function processMessage(message, outbound = false) {
     }
     const payload = {
       eventId,
+      accountId: serializedId(client.info?.wid || client.info?.me),
       waMessageId: originalId || '',
       chatId: sender,
       phone,
       customer: isGroup ? (groupName || 'Grupo '+phone.split('@')[0]) : contact.name,
       avatarUrl: contact.avatarUrl,
+      // Nunca actualizar la agenda con eventos históricos, propios ni grupos.
+      isSavedContact: !isGroup && !outbound && !historyOnly && typeof contact.isSavedContact === 'boolean' ? contact.isSavedContact : undefined,
       isGroup,
       senderName: isGroup ? senderName : '',
       ack: outbound && Number.isInteger(message.ack) ? message.ack : undefined,
       message: text,
       receivedAt,
+      historyOnly: Boolean(historyOnly),
       outbound: Boolean(outbound),
       hasMedia: isMediaMessage(message)
     };
@@ -930,7 +1118,9 @@ async function processMessage(message, outbound = false) {
     seen.add(eventId);
     persistSeen();
 
-    console.log('[TICKETBRIDGE] Mensaje registrado:',
+    if (!historyOnly) await sendAutomationReply(payload,result);
+
+    if (!historyOnly) console.log('[TICKETBRIDGE] Mensaje registrado:',
       result.status || 'ok', 'caso:', result.caseId || '-');
 
     // Enviar el archivo con el MISMO eventId: la API actualiza esa fila.
@@ -949,7 +1139,7 @@ async function processMessage(message, outbound = false) {
   }
 }
 
-client.on('message', message => {
+onClient('message', message => {
   recentMediaHistory.clear();
   processMessage(message, false).catch(error => {
     console.error(
@@ -959,7 +1149,7 @@ client.on('message', message => {
   });
 });
 
-client.on('message_ack',(message,ack)=>{
+onClient('message_ack',(message,ack)=>{
   if(!message?.fromMe || !Number.isInteger(ack))return;
   const id=messageId(normalizeMessage(message));
   if(!id)return;
@@ -969,7 +1159,7 @@ client.on('message_ack',(message,ack)=>{
   }).catch(e=>console.warn('[WHATSAPP] Confirmación pendiente:',errorText(e)));
 });
 
-client.on('message_create', message => {
+onClient('message_create', message => {
   if (!message.fromMe) return;
   recentMediaHistory.clear();
 
@@ -980,6 +1170,46 @@ client.on('message_create', message => {
     );
   });
 });
+
+
+// Al conectar, recuperar únicamente mensajes del día actual en Paraguay.
+// Se procesan chats visibles desde WhatsApp, nunca registros locales viejos.
+// Máximo 20 chats recientes y 180 mensajes para no bloquear Puppeteer.
+function asuncionDay(value){
+ return new Intl.DateTimeFormat('sv-SE',{timeZone:'America/Asuncion',year:'numeric',month:'2-digit',day:'2-digit'}).format(value);
+}
+let todayHistoryInFlight=false;
+async function importTodayVisibleHistory(){
+ if(!ready || todayHistoryInFlight) return;
+ todayHistoryInFlight=true;
+ historySync='running';
+ let processed=0, failed=0;
+ try{
+  const today=asuncionDay(new Date());
+  const chats=await client.getChats();
+  if(!ready || !Array.isArray(chats))throw new Error('Lista de chats no disponible');
+  const sorted=chats.filter(chat=>validConversationId(chatId(chat)) && chat.lastMessage &&
+   Number.isFinite(Number(chat.lastMessage.timestamp)) &&
+   asuncionDay(new Date(Number(chat.lastMessage.timestamp)*1000))===today)
+   .sort((a,b)=>Number(b.lastMessage.timestamp)-Number(a.lastMessage.timestamp)).slice(0,20);
+  for(const chat of sorted){
+   if(!ready || processed>=180)break;
+   let messages=[];
+   try{messages=await chat.fetchMessages({limit:Math.min(30,180-processed)});}
+   catch(error){failed++;console.warn('[SYNC HOY] Chat no recuperado:',errorText(error));continue;}
+   for(const m of messages){
+    if(!ready || processed>=180)break;
+    const ts=Number(m.timestamp);
+    if(!Number.isFinite(ts)||asuncionDay(new Date(ts*1000))!==today)continue;
+    try{await processMessage(m,Boolean(m.fromMe),true);processed++;}
+    catch(error){failed++;console.warn('[SYNC HOY] Mensaje no recuperado:',errorText(error));}
+   }
+  }
+  historySync=failed?'partial':'complete';
+  console.log(`[SYNC HOY] Finalizado: ${processed} mensajes revisados, ${failed} errores. No se envió ningún mensaje automático ni se creó un ticket.`);
+ }catch(error){historySync='error';console.warn('[SYNC HOY] Recuperación no disponible:',errorText(error));}
+ finally{todayHistoryInFlight=false;}
+}
 
 // ========================================
 // HISTORIAL MULTIMEDIA
@@ -1314,7 +1544,7 @@ async function reactionSnapshot(phone, ids) {
   return output;
 }
 
-client.on('message_reaction', reaction => {
+onClient('message_reaction', reaction => {
   const waMessageId=serializedId(reaction?.msgId);
   if (!waMessageId || !ready) return;
   const emoji=String(reaction?.reaction||'').slice(0,24);
@@ -1390,8 +1620,9 @@ function createBoundedWhatsAppReader(label, load, ttlMs, timeoutMs) {
   let pending = null;
   let pendingAt = 0;
   let lastDiagnosticAt = 0;
+  let generation = 0;
 
-  return async function read() {
+  const read = async function read() {
     const now = Date.now();
     if (cached !== null && now - cachedAt < ttlMs) {
       return { data: cached, source: 'cache' };
@@ -1399,15 +1630,17 @@ function createBoundedWhatsAppReader(label, load, ttlMs, timeoutMs) {
 
     if (!pending) {
       pendingAt = now;
+      const activeGeneration=generation;
       pending = Promise.resolve()
         .then(load)
         .then(data => {
           if (!Array.isArray(data)) throw new Error('WhatsApp devolvió datos inválidos');
+          if(activeGeneration!==generation)throw new Error('Consulta anterior a la sesión actual');
           cached = data;
           cachedAt = Date.now();
           return data;
         })
-        .finally(() => { pending = null; pendingAt = 0; });
+        .finally(() => { if(activeGeneration===generation){ pending = null; pendingAt = 0; } });
     }
 
     let timer;
@@ -1437,30 +1670,56 @@ function createBoundedWhatsAppReader(label, load, ttlMs, timeoutMs) {
       clearTimeout(timer);
     }
   };
+  read.reset=()=>{generation++;cached=null;cachedAt=0;pending=null;pendingAt=0;};
+  return read;
 }
 
 const readWhatsAppChats = createBoundedWhatsAppReader(
-  'Chats', () => client.getChats(), 8000, 4000
+  'Chats', () => client.getChats(), 8000, 6000
 );
+// Lectura forzada a demanda del operador: sin usar instantáneas viejas.
+const readFreshWhatsAppChats=createBoundedWhatsAppReader('Chats actuales',()=>client.getChats(),0,8500);
 const readWhatsAppContacts = createBoundedWhatsAppReader(
   'Agenda', () => client.getContacts(), 30000, 4500
 );
+function clearWhatsAppReadCache(){
+ readWhatsAppChats.reset();readFreshWhatsAppChats.reset();readWhatsAppContacts.reset();
+}
 
 const server = http.createServer(async (request, response) => {
   const route = request.url?.split('?')[0];
 
   try {
     if (request.method === 'GET' && route === '/status') {
+      const staleQr = qrExpired();
+      const stalled = ((!ready && !pairingQr && !lastQrError) || (qrStalled() && !lastQrError)) && connectionPhase !== 'authenticated' && connectionPhase !== 'synchronizing' && Date.now()-clientStartingAt>BROWSER_STARTUP_WARNING_MS;
       return sendJson(response, 200, {
+        browserActive: Boolean(client.pupBrowser?.isConnected?.()),
+        restartCount,
+        restartReason,
+        recoveryAvailable: !ready && !qrRefreshInFlight && !restartScheduled && (stalled || staleQr || Boolean(lastQrError)),
+        browserPageOpen: Boolean(client.pupPage && !client.pupPage.isClosed()),
+        browserObservation: lastBrowserObservation,
+        browserObservationSeconds: browserObservationAt ? Math.floor((Date.now()-browserObservationAt)/1000) : 0,
+        diagnostic: staleQr ? 'El último QR venció y WhatsApp Web no emitió uno nuevo. Podés solicitar otro QR.' :
+          stalled ? 'WhatsApp Web no generó QR ni confirmó sesión. Si continúa, Recuperar vinculación respalda el perfil anterior.' : null,
         connected: ready &&
           Boolean(client.info) &&
           !client.pupPage?.isClosed?.(),
         ready,
+        startupSeconds: Math.floor((Date.now()-clientStartingAt)/1000),
+        historySync,
+        // La cuenta no se divulga a procesos locales sin el secreto del conector.
+        accountId: ready && authorized(request) ? serializedId(client.info?.wid || client.info?.me) : null,
         service: 'whatsapp-connector',
-        version: 'ticketbridge-sync-v6.4',
-        capabilities: ['history', 'chat-state', 'contacts', 'recover-batch', 'discover', 'read-snapshot', 'reactions', 'reactions-snapshot', 'send-media', 'media-mimetype-fallback'],
+        version: 'ticketbridge-sync-v6.7-sync',
+        capabilities: ['history', 'chat-state', 'contacts', 'recover-batch', 'discover', 'read-snapshot', 'reactions', 'reactions-snapshot', 'send-media', 'media-mimetype-fallback', 'menu-numerado'],
         compatibility,
-        packageMediaPatched
+        packageMediaPatched,
+        pairingQrAvailable: currentQrAvailable(),
+        pairingPhase: ready?'connected':(qrRefreshInFlight || restartScheduled)?'restarting':
+          staleQr?'qr_expired':stalled?'stalled':connectionPhase,
+        pairingError: lastQrError||null
       });
     }
 
@@ -1470,10 +1729,109 @@ const server = http.createServer(async (request, response) => {
       });
     }
 
+    // El QR solo se obtiene con el secreto del conector, nunca en /status.
+    if (request.method === 'GET' && route === '/pairing-qr') {
+      if (ready) return sendJson(response,200,{connected:true,qr:null});
+      return sendJson(response,200,{connected:false,qr:currentQrAvailable()?pairingQr:null,
+        phase:(qrRefreshInFlight || restartScheduled)?'restarting':qrExpired()?'qr_expired':currentQrAvailable()?'scan':connectionPhase,
+        error:lastQrError||null});
+    }
+
+    // Solicitar nuevo QR SIN cerrar una sesión conectada ni borrar LocalAuth.
+    // Destruir/rehacer solo la instancia sin conexión; limitamos solicitudes.
+    if (request.method === 'POST' && route === '/regenerate-qr') {
+      if (ready || (client.info && !client.pupPage?.isClosed?.()))
+        return sendJson(response,409,{error:'WhatsApp ya está conectado; no corresponde generar otro QR.'});
+      if(qrRefreshInFlight || restartScheduled)return sendJson(response,202,{ok:true,phase:'restarting',message:'La vinculación se está reiniciando.'});
+      const wait=Math.max(0,QR_REFRESH_COOLDOWN_MS-(Date.now()-lastQrRefresh));
+      if(wait>0)return sendJson(response,429,{error:'Esperá '+Math.ceil(wait/1000)+' segundos para solicitar otro QR.',retryAfter:Math.ceil(wait/1000)});
+      // Dejar tiempo para que Chromium arranque antes de intervenir.
+      if(Date.now()-clientStartingAt<12000)return sendJson(response,409,{error:'WhatsApp está iniciándose. Esperá unos segundos y volvé a intentar.'});
+      lastQrRefresh=Date.now();
+      // Reservar el reinicio ANTES de devolver 202 para evitar solicitudes simultáneas.
+      restartScheduled=true;
+      setImmediate(() => {
+        void restartWhatsApp({reason:'renovación manual'})
+          .finally(() => { restartScheduled=false; });
+      });
+      return sendJson(response,202,{ok:true,phase:'restarting',message:'Solicitando un código QR nuevo. No se borró la sesión guardada.'});
+    }
+
+    // Recuperar un perfil de LocalAuth atascado SIN BORRARLO: se renombra a
+    // data/whatsapp-session-backups, y recién entonces se crea otro cliente.
+    // Es una acción explícita de operador, nunca automática.
+    if (request.method === 'POST' && route === '/relink-qr') {
+      if (ready || (client.info && !client.pupPage?.isClosed?.()))
+        return sendJson(response,409,{error:'La sesión está conectada; no se puede recuperar.'});
+      let input;
+      try { input=await readBody(request,2000); }
+      catch { return sendJson(response,400,{error:'Solicitud inválida'}); }
+      if (input?.confirm !== 'RECUPERAR VINCULACION')
+        return sendJson(response,400,{error:'Confirmación requerida'});
+      if (qrRefreshInFlight || restartScheduled) return sendJson(response,409,{error:'Recuperación en curso'});
+      const cooldown=Math.max(0,QR_REFRESH_COOLDOWN_MS-(Date.now()-lastQrRefresh));
+      if(cooldown>0)return sendJson(response,429,{error:'Esperá '+Math.ceil(cooldown/1000)+' segundos.',retryAfter:Math.ceil(cooldown/1000)});
+      lastQrRefresh=Date.now();
+      restartScheduled=true;
+      setImmediate(()=>{
+        void restartWhatsApp({reason:'recuperación solicitada',resetSession:true})
+          .finally(()=>{restartScheduled=false;});
+      });
+      return sendJson(response,202,{ok:true,message:'Se preparará una nueva vinculación. La sesión anterior se conservará como respaldo local.'});
+    }
+
+    // Desvinculación explícita desde Configuración. Nunca borrar data/, SQLite
+    // ni cerrar sesión por una simple consulta de estado.
+    if (request.method === 'POST' && route === '/logout') {
+      if (!ready) return sendJson(response,409,{error:'WhatsApp ya está desconectado'});
+      let body;
+      try { body=await readBody(request,2500); }
+      catch { return sendJson(response,400,{error:'Solicitud inválida'}); }
+      if (body?.confirm !== 'DESCONECTAR')return sendJson(response,400,{error:'Confirmación requerida'});
+      ready=false;
+      pairingQr=null;
+      try {
+        await client.logout();
+      } catch(error) {
+        console.warn('[WHATSAPP] La desvinculación requiere revisión:',errorText(error));
+        ready=Boolean(client.info)&&!client.pupPage?.isClosed?.();
+        return sendJson(response,502,{error:'WhatsApp no confirmó el cierre de sesión: '+errorText(error)});
+      }
+      console.log('[WHATSAPP] Sesión cerrada a petición del operador.');
+      // WhatsApp Web puede necesitar una inicialización nueva para generar QR.
+      // Si falla, se muestra al operador la instrucción de reiniciar el proceso.
+      const retry=setTimeout(()=>{
+        void restartWhatsApp({reason:'desvinculación explícita'});
+      },2200);
+      retry.unref?.();
+      return sendJson(response,200,{ok:true,connected:false,notice:'Sesión desvinculada. Esperá el nuevo QR; si no aparece, reiniciá npm run whatsapp.'});
+    }
+
     if (!ready) {
       return sendJson(response, 503, {
         error: 'WhatsApp todavía no está conectado'
       });
+    }
+
+    // Sincronización manual adicional sin respuestas automáticas ni tickets.
+    if (request.method === 'POST' && route === '/sync-today') {
+      if(todayHistoryInFlight)return sendJson(response,202,{ok:true,state:'running'});
+      setImmediate(()=>{void importTodayVisibleHistory();});
+      return sendJson(response,202,{ok:true,state:'started'});
+    }
+
+    // Lista de chats actualmente visibles en WhatsApp (no agenda de contactos).
+    // Las bajas se filtran en la vista local; nunca borramos evidencias de Jira.
+    if (request.method === 'GET' && route === '/chats-snapshot') {
+      const force=request.url?.includes('fresh=1')===true;
+      const result=await (force?readFreshWhatsAppChats():readWhatsAppChats());
+      if(!['whatsapp','cache'].includes(result.source))return sendJson(response,503,{error:'WhatsApp devolvió un listado de chats desactualizado'});
+      const ids=[];
+      for(const chat of result.data){
+        const id=chatId(chat);
+        if(validConversationId(id))ids.push(validGroupChatId(id)?id:id.split('@')[0]);
+      }
+      return sendJson(response,200,{phones:[...new Set(ids)],accountId:serializedId(client.info?.wid||client.info?.me)});
     }
 
     // Lectura real en otros dispositivos vinculados (incluido el teléfono).
@@ -1534,25 +1892,22 @@ const server = http.createServer(async (request, response) => {
         contactsResult.status === 'rejected' ? errorText(contactsResult.reason) : '');
       response.setHeader('X-TicketBridge-Contacts-Mode', partial ? 'partial' : 'whatsapp');
       const found = new Map();
-      for(const chat of chats){
-        const id=chatId(chat);
-        if(!validConversationId(id))continue;
-        rememberChat(id);
-        const phone=validGroupChatId(id)?id:id.split('@')[0];
-        found.set(phone,{phone,chatId:id,name:String(chat.name||phone).slice(0,120),isGroup:Boolean(chat.isGroup),unreadCount:Number(chat.unreadCount)||0});
-      }
+      // Únicamente contactos guardados en la agenda de WhatsApp. No usar chats recientes
+      // ni nombres sugeridos: no prueban que el usuario tenga el número guardado.
       for(const contact of addressBook){
+        if(contact?.isMyContact!==true)continue;
         const id=serializedId(contact?.id) || (contact?.id?.user && contact?.id?.server ? `${contact.id.user}@${contact.id.server}` : '');
         if(!validPrivateChatId(id))continue;
         const phone=id.split('@')[0];
-        if(found.has(phone))continue;
-        const name=String(contact.name||contact.pushname||phone).slice(0,120);
+        const name=String(contact.name||'').trim().slice(0,120);
+        if(!name || name===phone)continue;
         const displayPhone=String(contact.number||'').replace(/\D/g,'');
-        found.set(phone,{phone,chatId:id,name,isGroup:false,unreadCount:0,displayPhone:displayPhone.length>=5&&displayPhone.length<=40?displayPhone:undefined});
+        found.set(phone,{phone,chatId:id,name,isGroup:false,saved:true,displayPhone:displayPhone.length>=5&&displayPhone.length<=40?displayPhone:undefined});
       }
       const contacts=[...found.values()].filter(c=>
         !query || `${c.name} ${c.phone} ${c.displayPhone||''}`.toLowerCase().includes(query)
       ).sort((a,b)=>a.name.localeCompare(b.name,'es')).slice(0,500);
+      // Una respuesta parcial no debe incluir contactos de origen incierto.
       return sendJson(response, 200, contacts);
     }
 
@@ -1565,6 +1920,7 @@ const server = http.createServer(async (request, response) => {
     if (
       ![
         '/send',
+        '/send-contact',
         '/send-media',
         '/forward',
         '/chat-state',
@@ -2007,6 +2363,27 @@ const server = http.createServer(async (request, response) => {
        return sendJson(response,200,{sent:true,id,mediaSaved,warning});
       }
 
+    if (route === '/send-contact') {
+      const {phone,chatId:provided,contactPhone}=input||{};
+      if(typeof phone!=='string'||!(/^[0-9]{5,40}$/.test(phone)||validGroupChatId(phone))||
+        typeof contactPhone!=='string'||!/^\d{5,40}$/.test(contactPhone))
+        return sendJson(response,400,{error:'Datos de contacto inválidos'});
+      const list=await client.getContacts();
+      const contact=list.find(c=>c?.isMyContact===true &&
+        validPrivateChatId(serializedId(c?.id)) && serializedId(c.id).split('@')[0]===contactPhone &&
+        String(c.name||'').trim());
+      if(!contact)return sendJson(response,404,{error:'Este contacto no está guardado en la agenda de WhatsApp.'});
+      const target=await resolveSendChatId(phone,provided);
+      const vcard=typeof contact.getVCard==='function'?await contact.getVCard():null;
+      if(!vcard||!/^BEGIN:VCARD/m.test(vcard))return sendJson(response,422,{error:'WhatsApp no devolvió una tarjeta de contacto válida.'});
+      await repairWebMessageKeys();
+      const sent=normalizeMessage(await client.sendMessage(target,vcard,{parseVCards:true,sendSeen:false}));
+      const id=messageId(sent);
+      if(!id)return sendJson(response,502,{error:'Envío sin identificador confirmado; revisá WhatsApp antes de reintentar.'});
+      processMessage(sent,true).catch(err=>console.warn('[CONTACTOS] Registro saliente:',errorText(err)));
+      return sendJson(response,200,{sent:true,id});
+    }
+
     if (route === '/send') {
       const { phone, chatId: provided, text, quotedMessageId } = input;
 
@@ -2095,6 +2472,24 @@ const server = http.createServer(async (request, response) => {
 // INICIO Y CIERRE
 // ========================================
 
+// La lectura periódica de estados no crea tickets ni modifica Jira.
+// Permite detectar cierres incluso cuando el operador no abre el panel.
+let jiraStatusSyncInFlight = false;
+const jiraStatusSyncTimer = setInterval(async()=>{
+  if(jiraStatusSyncInFlight||process.env.JIRA_AUTO_STATUS_SYNC==='false'||process.env.ENABLE_REAL_JIRA!=='true')return;
+  jiraStatusSyncInFlight=true;
+  try{
+    const r=await fetch(API_BASE+'/api/jira/assignees/sync',{
+      method:'POST',headers:{'x-local-connector-secret':SECRET},
+      signal:AbortSignal.timeout(180000),cache:'no-store'
+    });
+    if(!r.ok)console.warn('[JIRA SYNC] HTTP',r.status);
+    else {const data=await r.json().catch(()=>({}));if(data.errors?.length)console.warn('[JIRA SYNC] Casos pendientes:',data.errors.slice(0,3));}
+  }catch(error){console.warn('[JIRA SYNC]',errorText(error));}
+  finally{jiraStatusSyncInFlight=false;}
+},300000);
+jiraStatusSyncTimer.unref?.();
+
 server.on('error', error => {
   if (error.code === 'EADDRINUSE') {
     console.error(
@@ -2116,25 +2511,65 @@ server.listen(PORT, '127.0.0.1', () => {
   );
 });
 
-client.initialize().catch(error => {
-  console.error(
-    '[WHATSAPP] Error inicializando:',
-    errorText(error)
-  );
-});
+// Revisión de vencimientos cada minuto, con reanudación tras reinicio. El servidor
+// valida el secreto y la BD impide llamar dos veces al mismo rol/ticket.
+const escalationTimer=setInterval(()=>{
+  fetch(`${API_BASE}/api/automation/escalate`,{method:'POST',headers:{'x-local-connector-secret':SECRET},signal:AbortSignal.timeout(18000)}).catch(e=>console.warn('[GUARDIA] Revisión pendiente:',errorText(e)));
+},60_000);
+escalationTimer.unref?.();
 
-let closing = false;
+setTimeout(() => {
+  if(!ready)console.warn('[WHATSAPP] Aún sin sesión lista. Consultá curl -s http://127.0.0.1:3217/status para conocer pairingPhase y pairingError. El puerto 3217 abierto no significa que WhatsApp esté conectado.');
+}, 20000).unref?.();
+// Un solo reintento automático cuando WhatsApp no emite QR ni authenticated.
+// Nunca se mueve ni borra LocalAuth sin confirmar desde el panel.
+const connectionWatchdog=setInterval(()=>{
+  // Los errores de Puppeteer NO deben desactivar el único reintento automático.
+  // Un QR reciente sí debe dejarse escanear; un QR vencido indefinidamente no.
+  if (closing || ready || qrRefreshInFlight || restartScheduled) return;
+  if (currentQrAvailable() || (pairingQrAt && !qrStalled())) return;
+  if (connectionPhase==='authenticated'||connectionPhase==='synchronizing') return;
+  if (Date.now()-clientStartingAt < AUTO_RESTART_AFTER_MS) return;
+  if (!automaticRestartUsed) {
+    automaticRestartUsed=true;
+    const hadError=Boolean(lastQrError);
+    console.warn('[WHATSAPP] Sin QR ni sesión tras 3 minutos'+(hadError?' (inicio con error)':'')+
+      '; reintentando una sola vez sin borrar el perfil.');
+    void restartWhatsApp({reason:hadError?'reintento tras error':'reintento automático único'});
+  } else if(connectionPhase!=='stalled' && connectionPhase!=='initialization_error') {
+    connectionPhase='stalled';
+    console.warn('[WHATSAPP] La vinculación continúa detenida. Usá Recuperar vinculación para respaldar la sesión e iniciar una nueva.');
+  }
+},15000);connectionWatchdog.unref?.();
+
+const startupMonitor=setInterval(()=>{
+ const state=client.pupPage && !client.pupPage.isClosed() ? 'Chromium tiene una página abierta' :
+   client.pupBrowser?.isConnected?.() ? 'Chromium está abierto pero aún no creó la página' :
+   'Chromium todavía no responde';
+ if(state!==lastBrowserObservation){
+   lastBrowserObservation=state;
+   browserObservationAt=Date.now();
+   if(!ready)console.log('[WHATSAPP] Estado de navegador:',state);
+ }
+ if(ready || currentQrAvailable() || lastQrError || qrRefreshInFlight || restartScheduled || browserStallWarned)return;
+ if(Date.now()-clientStartingAt < BROWSER_STARTUP_WARNING_MS)return;
+ browserStallWarned=true;
+ console.warn('[WHATSAPP] Inicio demorado más de 90 segundos. Navegador:',Boolean(client.pupBrowser?.isConnected?.()),'página:',Boolean(client.pupPage && !client.pupPage.isClosed()),'. Usá Generar nuevo QR desde el panel o WHATSAPP_BROWSER_VISIBLE=true npm run whatsapp para diagnosticar Chromium. No borres sesiones.');
+},15000);startupMonitor.unref?.();
+
+initializeActiveClient();
 
 async function shutdown() {
   if (closing) return;
 
   closing = true;
   ready = false;
+  connectionPhase = 'disconnected';
 
   console.log('[WHATSAPP] Cerrando conector...');
 
   try {
-    await client.destroy();
+    await stopClientBounded(client, 12000);
   } catch (error) {
     console.warn(errorText(error));
   }

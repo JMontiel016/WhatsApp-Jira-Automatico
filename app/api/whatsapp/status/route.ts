@@ -1,14 +1,39 @@
 import {NextResponse} from 'next/server';
-import {WHATSAPP_CONNECTOR_VERSION} from '@/lib/whatsapp-version';
-export const runtime='nodejs';export const dynamic='force-dynamic';
+import {
+  WHATSAPP_CONNECTOR_VERSION,
+  connectorReady,
+  isConnectorVersionCompatible,
+  readConnectorStatus
+} from '@/lib/whatsapp-version';
+
+export const runtime='nodejs';
+export const dynamic='force-dynamic';
+
 export async function GET(){
- try{
-  const r=await fetch('http://127.0.0.1:3217/status',{cache:'no-store',signal:AbortSignal.timeout(2500)});
-  if(!r.ok)return NextResponse.json({connected:false,service:false,compatible:false,error:'El conector no responde correctamente.'});
-  const data=await r.json();
-  const compatible=data.version===WHATSAPP_CONNECTOR_VERSION;
-  return NextResponse.json({connected:data.connected===true&&compatible,service:true,compatible,
-   version:typeof data.version==='string'?data.version:'anterior o desconocida',
-   error:compatible?null:`Hay otra versión del conector en el puerto 3217 (${data.version||'sin identificar'}). Cerrá la terminal del conector anterior, reiniciá npm run whatsapp y volvé a cargar la página.`});
- }catch{return NextResponse.json({connected:false,service:false,compatible:false,error:'No se encontró el conector. Iniciá npm run whatsapp.'});}
+  const d=await readConnectorStatus();
+  if(!d){
+    return NextResponse.json({
+      connected:false,service:false,compatible:false,accountId:null,
+      phase:'unavailable',version:null,expectedVersion:WHATSAPP_CONNECTOR_VERSION,
+      error:'Conector no disponible. Iniciá npm run whatsapp desde el proyecto principal.'
+    },{headers:{'Cache-Control':'no-store'}});
+  }
+  const compatible=isConnectorVersionCompatible(d.version);
+  const connected=connectorReady(d);
+  const phase=connected?'connected':!compatible?'incompatible':d.pairingPhase||'waiting';
+  const error=!compatible
+    ? `Versión incompatible: detectada ${String(d.version||'desconocida')}, requerida ${WHATSAPP_CONNECTOR_VERSION}.`
+    : d.pairingError||null;
+  return NextResponse.json({
+    connected,service:true,compatible,accountId:connected?d.accountId:null,
+    phase,version:d.version||null,expectedVersion:WHATSAPP_CONNECTOR_VERSION,
+    compiledExpectedVersion:WHATSAPP_CONNECTOR_VERSION,
+    startupSeconds:d.startupSeconds,historySync:d.historySync,
+    qrAvailable:d.pairingQrAvailable===true,
+    recoveryAvailable:d.recoveryAvailable===true,
+    restartCount:d.restartCount||0,restartReason:d.restartReason||'',
+    browserActive:d.browserActive===true,browserPageOpen:d.browserPageOpen===true,
+    browserObservation:d.browserObservation||null,
+    diagnostic:d.diagnostic||null,error
+  },{headers:{'Cache-Control':'no-store'}});
 }

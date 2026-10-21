@@ -1,6 +1,8 @@
 import {NextRequest,NextResponse} from 'next/server';
 import {mediaMime} from '@/lib/media';
 import {database} from '@/lib/db';
+import {linkedAccount} from '@/lib/active-account';
+import {markManualOutreach} from '@/lib/automation-controls';
 import {rejectCrossOrigin} from '@/lib/security';
 export const runtime='nodejs';
 
@@ -68,6 +70,9 @@ export async function POST(request:NextRequest){
       {sent?:boolean;id?:string;mediaSaved?:boolean;warning?:string;error?:string};
     if(!response.ok)return NextResponse.json({error:data.error||`WhatsApp rechazó el archivo (HTTP ${response.status})`},{status:response.status});
     if(data.sent!==true)return NextResponse.json({error:'WhatsApp no confirmó el envío; revisá el chat antes de reintentar'},{status:502});
+    if(!phone.endsWith('@g.us')){
+      try{const account=await linkedAccount();if(account)markManualOutreach(account,phone);}catch(error){console.warn('[BOT] No se pudo registrar atención humana:',error);}
+    }
     return NextResponse.json({sent:true,id:data.id,mediaSaved:data.mediaSaved===true,warning:data.warning||null},{headers:{'Cache-Control':'no-store'}});
   }catch(error){
     const timedOut=error instanceof Error&&(error.name==='TimeoutError'||error.name==='AbortError');

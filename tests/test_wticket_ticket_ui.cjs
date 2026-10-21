@@ -1,0 +1,20 @@
+'use strict';
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const root = path.resolve(__dirname, '..');
+const source = fs.readFileSync(path.join(root,'app/page.tsx'),'utf8');
+const api = fs.readFileSync(path.join(root,'app/api/jira/create/route.ts'),'utf8');
+const layout = fs.readFileSync(path.join(root,'app/layout.tsx'),'utf8');
+function check(name,condition){ assert.ok(condition,name);console.log('[OK]',name); }
+check('El diálogo de aprobación tiene JSX visible', source.includes('{approval&&<div className="approvalBackdrop"'));
+check('Confirmación positiva resuelve la promesa', source.includes('onClick={()=>closeApproval(true)}'));
+check('Cancelar no crea tickets', source.includes('onClick={()=>closeApproval(false)}'));
+check('El usuario ve el estado de envío', source.includes('Creando ticket en Jira…'));
+check('El resultado incluye clave CW y enlace', source.includes('Ticket {ticketSuccess.key} creado en Jira') && source.includes('Abrir {ticketSuccess.key}'));
+check('El formulario se cierra tras una respuesta confirmada', source.includes('setTicketDraft(null);setSelected('));
+check('El fallo se muestra sin cerrar el formulario', source.includes('ticketInlineError') && source.includes('setError(e instanceof Error?e.message'));
+check('Reintento de ticket incierto necesita autorización', source.includes("problem.code==='UNCONFIRMED_JIRA'") && source.includes('Ya verifiqué, continuar'));
+check('Evidencia fallida no falsea el éxito de Jira', api.includes('try { uploaded=await syncTicketEvidence(issue.key,ids); }') && api.includes('Ticket creado; no se pudieron confirmar las evidencias'));
+check('Marca W-Ticket en interfaz y pestaña', source.includes('W-<span>Ticket</span>') && layout.includes("W-Ticket | Soporte TI"));
+console.log('PASS: 10 comprobaciones estáticas; no se enviaron tickets ni WhatsApp.');

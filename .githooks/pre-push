@@ -1,0 +1,5 @@
+#!/bin/sh
+# Segunda comprobación de los archivos actuales antes de publicar.
+cd "$(git rev-parse --show-toplevel 2>/dev/null)" || exit 1
+node scripts/seguridad-local.cjs tracked || exit 1
+node scripts/seguridad-local.cjs verificar-next

@@ -42,6 +42,11 @@ export function database() {
   if (!attachmentCols.some(c=>c.name==='media_source')) db.exec("ALTER TABLE cases ADD COLUMN media_source TEXT NOT NULL DEFAULT 'whatsapp'");
   if (!attachmentCols.some(c=>c.name==='has_media')) db.exec('ALTER TABLE cases ADD COLUMN has_media INTEGER NOT NULL DEFAULT 0');
   db.exec('CREATE TABLE IF NOT EXISTS contact_profiles (phone TEXT PRIMARY KEY, name TEXT, avatar_url TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)');
+  // Evidencia de agenda WhatsApp segregada por cuenta. No deducir de nombres o historiales.
+  db.exec(`CREATE TABLE IF NOT EXISTS automation_saved_contacts (
+    account_id TEXT NOT NULL, phone TEXT NOT NULL, is_saved INTEGER NOT NULL CHECK(is_saved IN (0,1)),
+    checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(account_id,phone)
+  )`);
   const directionCols = db.pragma('table_info(cases)') as Array<{name:string}>;
   if (!directionCols.some(c=>c.name==='direction')) db.exec("ALTER TABLE cases ADD COLUMN direction TEXT NOT NULL DEFAULT 'in'");
   if (!directionCols.some(c=>c.name==='wa_message_id')) db.exec('ALTER TABLE cases ADD COLUMN wa_message_id TEXT');
@@ -70,6 +75,7 @@ export function database() {
   if(!ticketCols.some(c=>c.name==='jira_status'))db.exec('ALTER TABLE customer_jira_tickets ADD COLUMN jira_status TEXT');
   if(!ticketCols.some(c=>c.name==='jira_status_category'))db.exec('ALTER TABLE customer_jira_tickets ADD COLUMN jira_status_category TEXT');
   if(!ticketCols.some(c=>c.name==='jira_synced_at'))db.exec('ALTER TABLE customer_jira_tickets ADD COLUMN jira_synced_at TEXT');
+  if(!ticketCols.some(c=>c.name==='jira_closed_at'))db.exec('ALTER TABLE customer_jira_tickets ADD COLUMN jira_closed_at TEXT');
   // Conservar referencias de tickets creados antes de esta migración.
   db.exec(`INSERT OR IGNORE INTO customer_jira_tickets(phone,jira_key,jira_id,kind,title,status,created_at)
     SELECT phone,jira_key,jira_id,'issue','Ticket anterior '||jira_key,'created',created_at
@@ -113,6 +119,14 @@ export function database() {
       SELECT phone,MAX(received_at) FROM cases WHERE source='whatsapp' GROUP BY phone`);
     db.prepare('INSERT INTO settings(name,value) VALUES (?,?)').run('chat_preferences_migrated_v1','1');
   }
+  // Identidad de WhatsApp: no mostrar conversaciones de otro número vinculado.
+  const accountCols=db.pragma('table_info(cases)') as Array<{name:string}>;
+  if(!accountCols.some(c=>c.name==='account_id'))db.exec("ALTER TABLE cases ADD COLUMN account_id TEXT NOT NULL DEFAULT ''");
+  db.exec('CREATE INDEX IF NOT EXISTS idx_cases_account ON cases(account_id,id)');
+  db.exec(`CREATE TABLE IF NOT EXISTS automation_polls (
+    poll_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, account_id TEXT NOT NULL,
+    phone TEXT NOT NULL, answered_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
   db.prepare('INSERT OR IGNORE INTO settings(name,value) VALUES (?,?)').run('start','08:00');
   db.prepare('INSERT OR IGNORE INTO settings(name,value) VALUES (?,?)').run('end','18:00');
   return db;

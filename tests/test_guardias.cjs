@@ -1,0 +1,10 @@
+'use strict';
+const assert=require('node:assert/strict');const fs=require('node:fs');const path=require('node:path');
+const root=path.join(__dirname,'..');const src=fs.readFileSync(path.join(root,'lib/phone-escalation.ts'),'utf8');
+assert.match(src,/configuredTelephony=\(\)=>false/,'No llamar con número externo como si fuera WhatsApp Business');
+assert.match(src,/jiraDetails/,'Revalidar Jira');assert.match(src,/pending_integration/,'Guardar alerta pendiente');
+assert.doesNotMatch(src,/api\.twilio\.com|Calls\.json/,'La llamada real está bloqueada');
+const routing=fs.readFileSync(path.join(root,'lib/automation-routing.ts'),'utf8');
+assert.match(routing,/INSERT OR IGNORE INTO automation_ticket_link_delivery/);
+assert.match(routing,/text:link/);
+console.log('[OK] Guardias: avisos solo URL, anti-duplicados y llamadas reales bloqueadas hasta proveedor compatible');
